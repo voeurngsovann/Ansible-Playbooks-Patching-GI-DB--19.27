@@ -1,0 +1,66 @@
+- name: Apply Data Patch on First Nodes of Primary Databases
+  hosts: dbservers
+  vars:
+    new_db_home: /u01/app/oracle/product/19.27/dbhome_1
+    db_role: PRIMARY
+  remote_user: oracle
+  run_once: true
+
+  tasks:
+    - name: Register databases
+      ansible.builtin.shell:
+        cmd: "ps -ef | grep ora_pmon | grep -v grep | awk '{ print $NF }' | cut -c10-50 |  awk '{print substr($1, 1, length($1)-1)}'"
+      register: find_databases
+      tags: finddb
+
+    - name: Register instances
+      ansible.builtin.shell:
+        cmd: ps -ef | grep ora_pmon | grep -v grep | awk '{ print $NF }' | cut -c10-50
+      register: find_instances
+
+    - name: Apply datapatch
+      tags: datapatch
+      ansible.builtin.shell:
+        cmd: |
+          export PATH=$ORACLE_HOME/bin:$PATH
+          export instname={{ item }}
+          export dbname=$(echo $instname |  awk '{print substr($1, 1, length($1)-1)}')
+          export inst_id=$(echo $instname |  awk '{print substr($1,length($1),1)}')
+          export dbrole=$(srvctl config database -d $dbname | grep "Database role" | awk '{ print $NF }')
+          if [ "$inst_id" == 1 ] && [ "$dbrole" == "{{ db_role }}" ]; then
+            export ORACLE_HOME={{ new_db_home }}
+            export ORACLE_SID=$instname
+            export ORACLE_HOME={{ new_db_home }}
+            export PATH=$ORACLE_HOME/bin:$PATH
+            $ORACLE_HOME/OPatch/datapatch -verbose
+          fi
+      register: datapatch_candidates
+      async: 3600  # Set a suitable timeout in seconds, e.g., 1 hour
+      poll: 10     # Poll every 10 seconds to check if the task is done
+      loop: "{{ find_instances.stdout_lines }}"
+      throttle: 1
+
+    - name: Wait for datapatch to complete successfully
+      ansible.builtin.async_status:
+        jid: "{{ datapatch_candidates.results[0].ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 360  # Number of retries, e.g., 360 retries with 10 seconds interval = 1 hour max wait
+      delay: 10     # Delay between retries in seconds
+
+    - name: Check if datapatch was successful
+      ansible.builtin.assert:
+        that:
+          - job_result.finished
+          - job_result.rc == 0
+        fail_msg: "Datapatch failed to complete successfully"
+        success_msg: "Datapatch completed successfully"
+
+    - name: Execute another task after datapatch success
+      debug:
+        msg: "Proceeding with next task after datapatch success"
+
+    - name: Debug datapatch output
+      ansible.builtin.debug:
+        var: item.async_results.stdout
+      loop: "{{ datapatch_candidates.results }}"
